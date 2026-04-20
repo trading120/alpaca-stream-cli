@@ -1,83 +1,129 @@
-"""Handles incoming Alpaca WebSocket stream messages and maintains quote state."""
+"""Handles raw Alpaca stream messages and keeps the SnapshotStore up to date."""
 
-from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, Dict, Optional
 
 from alpaca_stream_cli.alerts import AlertEngine, TriggeredAlert
-from alpaca_stream_cli.display import QuoteSnapshot, render_snapshot
+from alpaca_stream_cli.display import QuoteSnapshot
+from alpaca_stream_cli.snapshot_store import SnapshotStore
 from alpaca_stream_cli.watchlist import Watchlist
+
+log = logging.getLogger(__name__)
+
+OnAlertCallback = Callable[[TriggeredAlert], None]
 
 
 class StreamHandler:
-    """Processes raw stream messages, updates state, and triggers rendering."""
+    """Processes incoming websocket messages from Alpaca's data stream."""
 
     def __init__(
         self,
         watchlist: Watchlist,
         alert_engine: AlertEngine,
-        on_render: Optional[Callable] = None,
+        store: Optional[SnapshotStore] = None,
+        on_alert: Optional[OnAlertCallback] = None,
     ) -> None:
         self.watchlist = watchlist
         self.alert_engine = alert_engine
-        self._on_render = on_render or render_snapshot
-        self._quotes: Dict[str, QuoteSnapshot] = {}
-        self._prev_close: Dict[str, float] = {}
+        self.store: SnapshotStore = store if store is not None else SnapshotStore()
+        self.on_alert = on_alert
+        # Accumulate intra-session volume per symbol
+        self._volume: Dict[str, int] = {}
 
-    def handle_message(self, msg: dict) -> None:
-        """Dispatch a single stream message by type."""
+    # ------------------------------------------------------------------
+    # Public entry-point
+    # ------------------------------------------------------------------
+
+    def handle_message(self, msg: Dict[str, Any]) -> None:
+        """Dispatch a single decoded message dict."""
         msg_type = msg.get("T")
-        if msg_type == "q":
-            self._handle_quote(msg)
-        elif msg_type == "t":
+        if msg_type == "t":
             self._handle_trade(msg)
+        elif msg_type == "q":
+            self._handle_quote(msg)
+        else:
+            log.debug("Unhandled message type: %s", msg_type)
 
-    def _handle_quote(self, msg: dict) -> None:
-        symbol = msg.get("S", "").upper()
-        if symbol not in self.watchlist.symbols:
+    # ------------------------------------------------------------------
+    # Internal handlers
+    # ------------------------------------------------------------------
+
+    def _handle_trade(self, msg: Dict[str, Any]) -> None:
+        symbol: str = msg.get("S", "").upper()
+        if symbol not in self.watchlist:
             return
-        existing = self._quotes.get(symbol)
-        self._quotes[symbol] = QuoteSnapshot(
-            symbol=symbol,
-            bid=float(msg.get("bp", existing.bid if existing else 0.0)),
-            ask=float(msg.get("ap", existing.ask if existing else 0.0)),
-            last=existing.last if existing else 0.0,
-            volume=existing.volume if existing else 0,
-            change_pct=existing.change_pct if existing else None,
-            timestamp=datetime.utcnow(),
-        )
-        self._refresh()
 
-    def _handle_trade(self, msg: dict) -> None:
-        symbol = msg.get("S", "").upper()
-        if symbol not in self.watchlist.symbols:
+        price: float = float(msg.get("p", 0.0))
+        size: int = int(msg.get("s", 0))
+
+        self._volume[symbol] = self._volume.get(symbol, 0) + size
+
+        existing = self.store.get(symbol)
+        if existing is not None:
+            prev = existing.last or price
+            change = price - prev
+            change_pct = (change / prev * 100.0) if prev else 0.0
+            updated = QuoteSnapshot(
+                symbol=symbol,
+                bid=existing.bid,
+                ask=existing.ask,
+                last=price,
+                change=change,
+                change_pct=change_pct,
+                volume=self._volume[symbol],
+            )
+        else:
+            updated = QuoteSnapshot(
+                symbol=symbol,
+                bid=None,
+                ask=None,
+                last=price,
+                change=0.0,
+                change_pct=0.0,
+                volume=self._volume[symbol],
+            )
+        self.store.update(updated)
+        self._fire_alerts(symbol, price, self._volume[symbol])
+
+    def _handle_quote(self, msg: Dict[str, Any]) -> None:
+        symbol: str = msg.get("S", "").upper()
+        if symbol not in self.watchlist:
             return
-        price = float(msg.get("p", 0.0))
-        volume = int(msg.get("s", 0))
-        prev_close = self._prev_close.get(symbol)
-        change_pct = ((price - prev_close) / prev_close * 100) if prev_close else None
 
-        existing = self._quotes.get(symbol)
-        self._quotes[symbol] = QuoteSnapshot(
-            symbol=symbol,
-            bid=existing.bid if existing else 0.0,
-            ask=existing.ask if existing else 0.0,
-            last=price,
-            volume=(existing.volume if existing else 0) + volume,
-            change_pct=change_pct,
-            timestamp=datetime.utcnow(),
-        )
-        self._refresh()
+        bid: float = float(msg.get("bp", 0.0))
+        ask: float = float(msg.get("ap", 0.0))
 
-    def set_prev_close(self, symbol: str, price: float) -> None:
-        self._prev_close[symbol.upper()] = price
+        existing = self.store.get(symbol)
+        if existing is not None:
+            updated = QuoteSnapshot(
+                symbol=symbol,
+                bid=bid,
+                ask=ask,
+                last=existing.last,
+                change=existing.change,
+                change_pct=existing.change_pct,
+                volume=existing.volume,
+            )
+        else:
+            updated = QuoteSnapshot(
+                symbol=symbol,
+                bid=bid,
+                ask=ask,
+                last=None,
+                change=0.0,
+                change_pct=0.0,
+                volume=0,
+            )
+        self.store.update(updated)
 
-    def _refresh(self) -> None:
-        snapshots = [self._quotes[s] for s in self.watchlist.symbols if s in self._quotes]
-        triggered: List[TriggeredAlert] = []
-        for snap in snapshots:
-            triggered.extend(self.alert_engine.evaluate(snap.symbol, snap.last, snap.volume))
-        self._on_render(snapshots, triggered)
+    # ------------------------------------------------------------------
+    # Alert helpers
+    # ------------------------------------------------------------------
 
-    @property
-    def quotes(self) -> Dict[str, QuoteSnapshot]:
-        return dict(self._quotes)
+    def _fire_alerts(self, symbol: str, price: float, volume: int) -> None:
+        triggered = self.alert_engine.evaluate(symbol, price, volume)
+        if triggered and self.on_alert:
+            for alert in triggered:
+                self.on_alert(alert)
