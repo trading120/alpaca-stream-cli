@@ -50,6 +50,14 @@ class PriceHistory:
             return None
         return ((last - first) / first) * 100
 
+    def high_low(self, symbol: str) -> Optional[tuple[float, float]]:
+        """Return the (high, low) prices seen for a symbol, or None if no history."""
+        points = self._history.get(symbol.upper())
+        if not points:
+            return None
+        prices = [p.price for p in points]
+        return max(prices), min(prices)
+
     def clear(self, symbol: str) -> None:
         """Clear history for a specific symbol."""
         self._history.pop(symbol.upper(), None)
