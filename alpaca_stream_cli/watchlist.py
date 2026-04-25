@@ -38,6 +38,15 @@ class Watchlist:
             return True
         return False
 
+    def clear(self) -> int:
+        """Remove all symbols from the watchlist.
+
+        Returns the number of symbols that were removed.
+        """
+        count = len(self._symbols)
+        self._symbols.clear()
+        return count
+
     def list(self) -> List[str]:
         """Return a copy of the current watchlist."""
         return list(self._symbols)
