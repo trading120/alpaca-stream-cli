@@ -55,6 +55,18 @@ def test_reset_clears_triggered_state(basic_alerts):
     assert len(fired) == 1
 
 
+def test_reset_all_clears_all_symbols(basic_alerts):
+    """Resetting all symbols allows alerts to fire again for every symbol."""
+    engine = AlertEngine(basic_alerts)
+    engine.evaluate("AAPL", price=210.0)
+    engine.evaluate("TSLA", volume=2_000_000)
+    engine.reset()
+    fired_aapl = engine.evaluate("AAPL", price=220.0)
+    fired_tsla = engine.evaluate("TSLA", volume=3_000_000)
+    assert len(fired_aapl) == 1
+    assert len(fired_tsla) == 1
+
+
 def test_callback_is_called(basic_alerts):
     received = []
     engine = AlertEngine(basic_alerts, callback=received.append)
